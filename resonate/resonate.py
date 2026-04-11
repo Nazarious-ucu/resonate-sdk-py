@@ -22,6 +22,7 @@ from resonate.models.message_source import MessageSource
 from resonate.models.store import Store
 from resonate.options import Options
 from resonate.registry import Registry
+from resonate.server_pool import PriorityPool, RoundRobinPool
 from resonate.stores import LocalStore, RemoteStore
 
 if TYPE_CHECKING:
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from resonate.models.encoder import Encoder
     from resonate.models.logger import Logger
     from resonate.models.retry_policy import RetryPolicy
+    from resonate.models.server_pool import ServerPool
     from resonate.models.store import PromiseStore, ScheduleStore
 
 ALLOWED_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -94,6 +96,8 @@ class Resonate:
         self,
         *,
         url: str | None = None,
+        urls: list[str] | None = None,
+        failover: Literal["priority", "round_robin"] = "priority",
         auth: tuple[str, str] | None = None,
         token: str | None = None,
         group: str = "default",
@@ -163,22 +167,29 @@ class Resonate:
         self._started = False
         self._ttl = ttl
         self._workers = workers
+        self._pool: ServerPool | None = None
 
         if store and message_source:
             # Power user mode: use provided store and message source directly
             self._store = store
             self._message_source = message_source
         else:
-            # Auto-detect mode: resolve URL from params and env vars
-            resolved_url = url
-            if not resolved_url:
-                resolved_url = os.getenv("RESONATE_URL")
-            if not resolved_url:
-                resonate_host = os.getenv("RESONATE_HOST")
-                if resonate_host:
-                    resonate_scheme = os.getenv("RESONATE_SCHEME", "http")
-                    resonate_port = os.getenv("RESONATE_PORT", "8001")
-                    resolved_url = f"{resonate_scheme}://{resonate_host}:{resonate_port}"
+            # Auto-detect mode: resolve URL list from params and env vars
+            resolved_urls: list[str] = []
+            if urls:
+                resolved_urls = list(urls)
+            elif url:
+                resolved_urls = [url]
+            else:
+                env_url = os.getenv("RESONATE_URL")
+                if env_url:
+                    resolved_urls = [env_url]
+                else:
+                    resonate_host = os.getenv("RESONATE_HOST")
+                    if resonate_host:
+                        resonate_scheme = os.getenv("RESONATE_SCHEME", "http")
+                        resonate_port = os.getenv("RESONATE_PORT", "8001")
+                        resolved_urls = [f"{resonate_scheme}://{resonate_host}:{resonate_port}"]
 
             # Resolve auth from params and env vars
             resolved_token = token or os.getenv("RESONATE_TOKEN")
@@ -189,10 +200,21 @@ class Resonate:
                     resonate_password = os.getenv("RESONATE_PASSWORD", "")
                     resolved_auth = (resonate_username, resonate_password)
 
-            if resolved_url:
-                # Remote mode
-                self._store = RemoteStore(url=resolved_url, auth=resolved_auth, token=resolved_token)
-                self._message_source = Poller(group=self._group, id=self._pid, url=resolved_url, auth=resolved_auth, token=resolved_token)
+            if resolved_urls:
+                # Remote mode — build a shared pool so store and poller track health together
+                self._pool = (
+                    RoundRobinPool(resolved_urls)
+                    if failover == "round_robin"
+                    else PriorityPool(resolved_urls)
+                )
+                self._store = RemoteStore(pool=self._pool, auth=resolved_auth, token=resolved_token)
+                self._message_source = Poller(
+                    group=self._group,
+                    id=self._pid,
+                    pool=self._pool,
+                    auth=resolved_auth,
+                    token=resolved_token,
+                )
             else:
                 # Local mode
                 self._store = LocalStore()
@@ -229,11 +251,15 @@ class Resonate:
         functions registered with Resonate.
         """
         if not self._started:
+            if self._pool is not None:
+                self._pool.start()
             self._bridge.start()
 
     def stop(self) -> None:
         """Stop resonate."""
         self._started = False
+        if self._pool is not None:
+            self._pool.stop()
         self._bridge.stop()
 
     def options(

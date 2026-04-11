@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import requests
 from requests import PreparedRequest, Request, Session
@@ -15,10 +16,12 @@ from resonate.models.durable_promise import DurablePromise
 from resonate.models.schedules import Schedule
 from resonate.models.task import Task
 from resonate.retry_policies import Constant
+from resonate.server_pool import PriorityPool
 
 if TYPE_CHECKING:
     from resonate.models.encoder import Encoder
     from resonate.models.retry_policy import RetryPolicy
+    from resonate.models.server_pool import ServerPool
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +35,9 @@ class RemoteStore:
         encoder: Encoder[str | None, str | None] | None = None,
         timeout: float | tuple[float, float] = 5,
         retry_policy: RetryPolicy | None = None,
+        pool: ServerPool | None = None,
     ) -> None:
-        self._url = url or "http://localhost:8001"
+        self._pool: ServerPool = pool or PriorityPool([url or "http://localhost:8001"])
         self._auth = auth
         self._token = token
         self._encoder = encoder or Base64Encoder()
@@ -46,7 +50,7 @@ class RemoteStore:
 
     @property
     def url(self) -> str:
-        return self._url
+        return self._pool.active()
 
     @property
     def encoder(self) -> Encoder[str | None, str | None]:
@@ -65,52 +69,80 @@ class RemoteStore:
         return self._schedules
 
     def call(self, req: PreparedRequest) -> Any:
-        attempt = 0
+        # Extract path+query so the base URL can be swapped on failover
+        parsed = urlparse(req.url)
+        path_and_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
         if self._token:
             req.headers["Authorization"] = f"Bearer {self._token}"
         elif self._auth:
             req.prepare_auth(self._auth)
 
+        attempt = 0
         with Session() as s:
             while True:
                 delay = self._retry_policy.next(attempt)
                 attempt += 1
 
+                current_url = self._pool.active()
+                req.url = f"{current_url}{path_and_query}"
+
                 try:
                     res = s.send(req, timeout=self._timeout)
                     if res.status_code == 204:
+                        self._pool.report_success(current_url)
                         return None
 
                     res.raise_for_status()
                     data = res.json()
+
                 except requests.exceptions.HTTPError as e:
                     try:
                         error = e.response.json()["error"]
                     except Exception:
                         error = {"message": e.response.text, "code": 0}
 
-                    # Only a 500 response code should be retried
-                    if delay is None or e.response.status_code != 500:
+                    # 5xx responses are transient — retry with potential failover
+                    if e.response.status_code >= 500:
+                        self._pool.report_failure(current_url)
+                        if delay is None:
+                            mesg = error.get("message", "Unknown exception")
+                            code = error.get("code", 0)
+                            details = error.get("details")
+                            raise ResonateStoreError(mesg=mesg, code=code, details=details) from e
+                        logger.warning(
+                            "Networking. Server %s returned %s. Retrying in %s sec",
+                            current_url,
+                            e.response.status_code,
+                            delay,
+                        )
+                    else:
+                        # 4xx — client error, do not retry
                         mesg = error.get("message", "Unknown exception")
                         code = error.get("code", 0)
                         details = error.get("details")
                         raise ResonateStoreError(mesg=mesg, code=code, details=details) from e
+
                 except requests.exceptions.Timeout as e:
+                    self._pool.report_failure(current_url)
                     if delay is None:
                         raise ResonateStoreError(mesg="Request timed out", code=0) from e
+                    logger.warning("Networking. Cannot connect to %s. Retrying in %s sec", current_url, delay)
 
-                    logger.warning("Networking. Cannot connect to %s. Retrying in %s sec", self.url, delay)
                 except requests.exceptions.ConnectionError as e:
+                    self._pool.report_failure(current_url)
                     if delay is None:
                         raise ResonateStoreError(mesg="Failed to connect", code=0) from e
+                    logger.warning("Networking. Cannot connect to %s. Retrying in %s sec", current_url, delay)
 
-                    logger.warning("Networking. Cannot connect to %s. Retrying in %s sec", self.url, delay)
                 except Exception as e:
+                    self._pool.report_failure(current_url)
                     if delay is None:
                         raise ResonateStoreError(mesg="Unknown exception", code=0) from e
+                    logger.warning("Networking. Cannot connect to %s. Retrying in %s sec", current_url, delay)
 
-                    logger.warning("Networking. Cannot connect to %s. Retrying in %s sec", self.url, delay)
                 else:
+                    self._pool.report_success(current_url)
                     return data
 
                 time.sleep(delay)
