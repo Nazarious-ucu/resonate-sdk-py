@@ -57,6 +57,10 @@ class PriorityPool:
             else None
         )
 
+    @property
+    def urls(self) -> list[str]:
+        return list(self._urls)
+
     def active(self) -> str:
         for url in self._urls:
             if self._breakers[url].allow_request():
@@ -139,6 +143,10 @@ class RoundRobinPool:
             if health_check_interval is not None
             else None
         )
+
+    @property
+    def urls(self) -> list[str]:
+        return list(self._urls)
 
     def active(self) -> str:
         with self._lock:
