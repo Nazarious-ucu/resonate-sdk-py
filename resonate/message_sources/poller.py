@@ -10,10 +10,12 @@ import requests
 
 from resonate.encoders import JsonEncoder
 from resonate.models.message import InvokeMesg, Mesg, NotifyMesg, ResumeMesg
+from resonate.server_pool import PriorityPool
 from resonate.utils import exit_on_exception
 
 if TYPE_CHECKING:
     from resonate.models.encoder import Encoder
+    from resonate.models.server_pool import ServerPool
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +30,12 @@ class Poller:
         token: str | None = None,
         timeout: float | None = None,
         encoder: Encoder[Any, str] | None = None,
+        pool: ServerPool | None = None,
     ) -> None:
         self._messages = queue.Queue[Mesg | None]()
         self._group = group
         self._id = id
-        self._url = url or "http://localhost:8001"
+        self._pool: ServerPool = pool or PriorityPool([url or "http://localhost:8001"])
         self._auth = auth
         self._token = token
         self._timeout = timeout
@@ -42,7 +45,7 @@ class Poller:
 
     @property
     def url(self) -> str:
-        return f"{self._url}/poll/{self._group}/{self._id}"
+        return f"{self._pool.active()}/poll/{self._group}/{self._id}"
 
     @property
     def unicast(self) -> str:
@@ -79,6 +82,9 @@ class Poller:
     def loop(self) -> None:
         delay = 5
         while not self._stopped:
+            current_url = self._pool.active()
+            poll_url = f"{current_url}/poll/{self._group}/{self._id}"
+
             try:
                 headers: dict[str, str] = {}
                 auth = None
@@ -87,8 +93,9 @@ class Poller:
                 elif self._auth:
                     auth = self._auth
 
-                with requests.get(self.url, auth=auth, headers=headers, stream=True, timeout=self._timeout) as res:
+                with requests.get(poll_url, auth=auth, headers=headers, stream=True, timeout=self._timeout) as res:
                     res.raise_for_status()
+                    self._pool.report_success(current_url)
 
                     for line in res.iter_lines(chunk_size=None, decode_unicode=True):
                         assert isinstance(line, str), "line must be a string"
@@ -96,16 +103,25 @@ class Poller:
                             self._messages.put(msg)
 
             except requests.exceptions.Timeout:
-                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", self._url, delay)
-                time.sleep(delay)
+                self._pool.report_failure(current_url)
+                next_url = self._pool.active()
+                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", current_url, delay)
+                if next_url == current_url:
+                    time.sleep(delay)
                 continue
             except requests.exceptions.RequestException:
-                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", self._url, delay)
-                time.sleep(delay)
+                self._pool.report_failure(current_url)
+                next_url = self._pool.active()
+                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", current_url, delay)
+                if next_url == current_url:
+                    time.sleep(delay)
                 continue
             except Exception:
-                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", self._url, delay)
-                time.sleep(delay)
+                self._pool.report_failure(current_url)
+                next_url = self._pool.active()
+                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", current_url, delay)
+                if next_url == current_url:
+                    time.sleep(delay)
                 continue
 
     def _process_line(self, line: str) -> Mesg | None:
