@@ -1,113 +1,105 @@
-![resonate banner](./assets/resonate-banner.png)
+# Fault-Tolerant Multi-Server Support for the Resonate Python SDK
 
-# Resonate Python SDK
+> Bachelor's thesis project
 
-[![ci](https://github.com/resonatehq/resonate-sdk-py/actions/workflows/ci.yml/badge.svg)](https://github.com/resonatehq/resonate-sdk-py/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/resonatehq/resonate-sdk-py/graph/badge.svg?token=61GYC3DXID)](https://codecov.io/gh/resonatehq/resonate-sdk-py)
-[![dst](https://github.com/resonatehq/resonate-sdk-py/actions/workflows/dst.yml/badge.svg)](https://github.com/resonatehq/resonate-sdk-py/actions/workflows/dst.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-## About this component
+---
 
-The Resonate Python SDK enables developers to build reliable and scalable cloud applications across a wide variety of use cases.
+## Abstract
 
-- [How to contribute to this SDK](./CONTRIBUTING.md)
-- [Evaluate Resonate for your next project](https://docs.resonatehq.io/evaluate/)
-- [Example application library](https://github.com/resonatehq-examples)
-- [The concepts that power Resonate](https://www.distributed-async-await.io/)
-- [Join the Discord](https://resonatehq.io/discord)
-- [Subscribe to the Blog](https://journal.resonatehq.io/subscribe)
-- [Follow on X](https://x.com/resonatehqio)
-- [Follow on LinkedIn](https://www.linkedin.com/company/resonatehqio)
-- [Subscribe on YouTube](https://www.youtube.com/@resonatehqio)
+The Resonate Python SDK provides durable, distributed-async-await execution by
+checkpointing every function step into durable promises stored on a Resonate
+Server. In its upstream form, the SDK talks to **one** server — if that server
+becomes unreachable, every connected worker stalls until it comes back, even
+when other healthy replicas exist.
+
+This thesis extends the SDK with **transparent multi-server support**: a worker
+can be configured with a list of server URLs and continue operating across
+server crashes, network partitions, and rolling deployments without losing
+work or requiring a restart. Health is tracked per-server with a circuit
+breaker, and the same health view is shared between the HTTP store and the
+SSE message poller so a failure observed by either side is immediately visible
+to the other.
+
+## Contributions
+
+1. **`ServerPool` abstraction** — a `Protocol` decoupling the rest of the SDK
+   from any specific routing strategy.
+2. **Two pool implementations**:
+   - `PriorityPool` — primary + warm standbys (failover only).
+   - `RoundRobinPool` — even load distribution across healthy peers.
+3. **Per-server `CircuitBreaker`** — `CLOSED → OPEN → HALF_OPEN → CLOSED`,
+   tunable via constructor or environment variables.
+4. **Shared pool wiring** — one pool instance is reused by `RemoteStore` and
+   `Poller`, so health signals from real traffic and background `/ping`
+   probes converge.
+5. **Per-URL SSE poller** — the message source keeps one persistent SSE
+   connection per server, matching how the broker fans messages out.
+6. **Idempotent task delivery** — the bridge swallows the benign error codes
+   that arise when several servers deliver the same task to a worker.
+7. **Retry-policy hardening** — `ExponentialJitter` policy, and corrected
+   `5xx` classification (502/503/504 are now retried, not raised).
+
+
+## Repository layout
+
+```
+resonate/
+├── circuit_breaker.py            # Per-server CB state machine        [new]
+├── server_pool.py                # PriorityPool, RoundRobinPool       [new]
+├── models/server_pool.py         # ServerPool Protocol                [new]
+├── retry_policies/
+│   └── exponential_jitter.py     # Jittered backoff                   [new]
+├── stores/remote.py              # Pool-aware HTTP store              [modified]
+├── message_sources/poller.py     # One persistent SSE thread per URL  [modified]
+├── bridge.py                     # Duplicate-delivery tolerance       [modified]
+└── resonate.py                   # `urls=` / `failover=` API          [modified]
+
+tests/                            # Behavioral and fault-injection tests
+MULTI_SERVER.md                   # Feature reference (user-facing)
+```
 
 ## Quickstart
 
-![quickstart banner](./assets/quickstart-banner.png)
-
-1. Install the Resonate Server & CLI
-
 ```shell
+# Resonate Server & CLI
 brew install resonatehq/tap/resonate
+
+# SDK (development install)
+uv sync
 ```
 
-2. Install the Resonate SDK
-
-```shell
-pip install resonate-sdk
-```
-
-3. Write your first Resonate Function
-
-A countdown as a loop. Simple, but the function can run for minutes, hours, or days, despite restarts.
+A worker with multi-server support:
 
 ```python
 from resonate import Resonate, Context
 from threading import Event
 
-# Instantiate Resonate
-resonate = Resonate.remote()
+# Priority failover across two servers
+resonate = Resonate(
+    urls=["http://primary:8001", "http://secondary:8001"],
+)
 
 @resonate.register
 def countdown(ctx: Context, count: int, delay: int):
     for i in range(count, 0, -1):
-        # Run a function, persist its result
         yield ctx.run(ntfy, i)
-        # Sleep
         yield ctx.sleep(delay)
-    print("Done!")
 
 
 def ntfy(_: Context, i: int):
     print(f"Countdown: {i}")
 
 
-resonate.start() # Start Resonate threads
-Event().wait()  # Keep the main thread alive
+resonate.start()
+Event().wait()
 ```
 
-[Working example](https://github.com/resonatehq-examples/example-quickstart-py)
+Kill the primary server mid-countdown — the worker fails over to the secondary
+within one circuit-breaker cycle and resumes from the last durable promise.
 
-4. Start the server
 
-```shell
-resonate dev
-```
+## Acknowledgements
 
-5. Start the worker
-
-```shell
-python countdown.py
-```
-
-6. Run the function
-
-Run the function with execution ID `countdown.1`:
-
-```shell
-resonate invoke countdown.1 --func countdown --arg 5 --arg 60
-```
-
-**Result**
-
-You will see the countdown in the terminal
-
-```shell
-python countdown.py
-Countdown: 5
-Countdown: 4
-Countdown: 3
-Countdown: 2
-Countdown: 1
-Done!
-```
-
-**What to try**
-
-After starting the function, inspect the current state of the execution using the `resonate tree` command. The tree command visualizes the call graph of the function execution as a graph of durable promises.
-
-```shell
-resonate tree countdown.1
-```
-
-Now try killing the worker mid-countdown and restarting. **The countdown picks up right where it left off without missing a beat.**
+- The [Resonate HQ](https://resonatehq.io) team for the upstream SDK and the
+  distributed-async-await model that this work builds on.

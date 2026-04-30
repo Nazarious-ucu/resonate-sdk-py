@@ -40,8 +40,16 @@ class Poller:
         self._token = token
         self._timeout = timeout
         self._encoder = encoder or JsonEncoder()
-        self._thread = Thread(name="message-source::poller", target=self.loop, daemon=True)
         self._stopped = False
+        self._threads = [
+            Thread(
+                name=f"message-source::poller::{u}",
+                target=self._loop_for_url,
+                args=(u,),
+                daemon=True,
+            )
+            for u in self._pool.urls
+        ]
 
     @property
     def url(self) -> str:
@@ -56,8 +64,9 @@ class Poller:
         return f"poll://any@{self._group}/{self._id}"
 
     def start(self) -> None:
-        if not self._thread.is_alive():
-            self._thread.start()
+        for t in self._threads:
+            if not t.is_alive():
+                t.start()
 
     def stop(self) -> None:
         # signal to consumer to disconnect
@@ -79,12 +88,11 @@ class Poller:
         return self._messages.get()
 
     @exit_on_exception
-    def loop(self) -> None:
-        delay = 5
+    def _loop_for_url(self, url: str) -> None:
+        """Maintain one persistent SSE connection to a single fixed server URL."""
+        delay = 2
+        poll_url = f"{url}/poll/{self._group}/{self._id}"
         while not self._stopped:
-            current_url = self._pool.active()
-            poll_url = f"{current_url}/poll/{self._group}/{self._id}"
-
             try:
                 headers: dict[str, str] = {}
                 auth = None
@@ -95,34 +103,21 @@ class Poller:
 
                 with requests.get(poll_url, auth=auth, headers=headers, stream=True, timeout=self._timeout) as res:
                     res.raise_for_status()
-                    self._pool.report_success(current_url)
+                    self._pool.report_success(url)
 
                     for line in res.iter_lines(chunk_size=None, decode_unicode=True):
                         assert isinstance(line, str), "line must be a string"
                         if msg := self._process_line(line):
                             self._messages.put(msg)
 
-            except requests.exceptions.Timeout:
-                self._pool.report_failure(current_url)
-                next_url = self._pool.active()
-                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", current_url, delay)
-                if next_url == current_url:
-                    time.sleep(delay)
-                continue
             except requests.exceptions.RequestException:
-                self._pool.report_failure(current_url)
-                next_url = self._pool.active()
-                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", current_url, delay)
-                if next_url == current_url:
-                    time.sleep(delay)
-                continue
+                self._pool.report_failure(url)
+                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", url, delay)
+                time.sleep(delay)
             except Exception:
-                self._pool.report_failure(current_url)
-                next_url = self._pool.active()
-                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", current_url, delay)
-                if next_url == current_url:
-                    time.sleep(delay)
-                continue
+                self._pool.report_failure(url)
+                logger.warning("Networking. Cannot connect to %s. Retrying in %s sec.", url, delay)
+                time.sleep(delay)
 
     def _process_line(self, line: str) -> Mesg | None:
         if not line:

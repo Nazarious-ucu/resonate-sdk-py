@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 
 from resonate.conventions import Base
 from resonate.delay_q import DelayQ
-from resonate.errors import ResonateShutdownError
+import logging
+
+from resonate.errors import ResonateShutdownError, ResonateStoreError
 from resonate.models.commands import (
     CancelPromiseReq,
     CancelPromiseRes,
@@ -261,7 +263,15 @@ class Bridge:
                                 continue
 
                             if task is not None:
-                                self._store.tasks.complete(id=task.id, counter=task.counter)
+                                try:
+                                    self._store.tasks.complete(id=task.id, counter=task.counter)
+                                except ResonateStoreError as e:
+                                    if e.code in (100.40306, 100.40307, 100.40308, 100.40403):
+                                        # Task already completed / claimed elsewhere / counter stale
+                                        # / task deleted by server. Safe to drop: nothing to complete.
+                                        pass
+                                    else:
+                                        raise
 
     @exit_on_exception
     def _process_msgs(self) -> None:
@@ -294,18 +304,34 @@ class Bridge:
                 root,
             )
 
+        _log = logging.getLogger(__name__)
+
         while msg := self._message_source.next():
             match msg:
                 case {"type": "invoke", "task": {"id": id, "counter": counter}}:
                     task = Task(id, counter, self._store)
-                    root, _ = self._store.tasks.claim(id=task.id, counter=task.counter, pid=self._pid, ttl=self._ttl * 1000)
+                    try:
+                        root, _ = self._store.tasks.claim(id=task.id, counter=task.counter, pid=self._pid, ttl=self._ttl * 1000)
+                    except ResonateStoreError as e:
+                        if e.code in (100.40306, 100.40307, 100.40308, 100.40403):
+                            # Duplicate delivery: another server already claimed or completed
+                            # this task (expected in multi-server deployments). Skip it.
+                            _log.debug("Skipping duplicate invoke task %s/%s: %s", id, counter, e.mesg)
+                            continue
+                        raise
                     self.start_heartbeat()
                     self._promise_id_to_task[root.id] = task
                     self._cq.put_nowait(_invoke(root))
 
                 case {"type": "resume", "task": {"id": id, "counter": counter}}:
                     task = Task(id, counter, self._store)
-                    root, leaf = self._store.tasks.claim(id=task.id, counter=task.counter, pid=self._pid, ttl=self._ttl * 1000)
+                    try:
+                        root, leaf = self._store.tasks.claim(id=task.id, counter=task.counter, pid=self._pid, ttl=self._ttl * 1000)
+                    except ResonateStoreError as e:
+                        if e.code in (100.40306, 100.40307, 100.40308, 100.40403):
+                            _log.debug("Skipping duplicate resume task %s/%s: %s", id, counter, e.mesg)
+                            continue
+                        raise
                     self.start_heartbeat()
                     assert leaf is not None, "leaf must not be None"
                     cmd = Resume(
@@ -361,7 +387,16 @@ class Bridge:
         while not self._shutdown.is_set():
             # If this timeout don't execute the heartbeat
             if self._heartbeat_active.wait(0.3):
-                heartbeated = self._store.tasks.heartbeat(pid=self._pid)
+                try:
+                    heartbeated = self._store.tasks.heartbeat(pid=self._pid)
+                except ResonateStoreError as e:
+                    # Transient store errors during a server freeze/fault must not
+                    # kill the heartbeat thread. 4xx "task moved on" codes are benign;
+                    # network/timeout codes (code=0) also recover on next tick.
+                    if e.code in (100.40306, 100.40307, 100.40308, 100.40403) or e.code == 0:
+                        self._shutdown.wait(self._ttl * 0.5)
+                        continue
+                    raise
                 if heartbeated == 0:
                     self._heartbeat_active.clear()
                 else:
